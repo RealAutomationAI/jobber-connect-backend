@@ -16,21 +16,20 @@ router = APIRouter()
 JOBBER_CLIENT_ID = os.environ["JOBBER_CLIENT_ID"]
 JOBBER_CLIENT_SECRET = os.environ["JOBBER_CLIENT_SECRET"]
 JOBBER_REDIRECT_URI = os.environ["JOBBER_REDIRECT_URI"]  # e.g. https://william-auth-production.up.railway.app/jobber/callback
-N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL")      # e.g. https://n8n.yourdomain.com/webhook/jobber-tokens
+N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL")
 
 JOBBER_AUTH_URL = "https://api.getjobber.com/api/oauth/authorize"
 JOBBER_TOKEN_URL = "https://api.getjobber.com/api/oauth/token"
 JOBBER_GRAPHQL_URL = "https://api.getjobber.com/api/graphql"
-JOBBER_GRAPHQL_VERSION = "2023-08-18"  # update when you want a newer version
+JOBBER_GRAPHQL_VERSION = "2023-08-18"
+
 
 # ==== STUBS / HELPERS =======================================================
 
 async def get_william_client_id_by_phone(phone_number: str) -> str | None:
     """
-    TEMP: replace with real lookup in your William client DB.
-    Given a phone number, return your internal client_id.
+    TEMP: replace with real lookup in your DB later.
     """
-    # For now always map to a test client.
     return "test_client_1"
 
 
@@ -56,24 +55,13 @@ async def store_jobber_tokens_for_client(
 
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                N8N_WEBHOOK_URL,
-                json=payload,
-                timeout=15,
-            )
+            resp = await client.post(N8N_WEBHOOK_URL, json=payload, timeout=15)
+        print("SENT_JOBBER_TOKENS_TO_N8N", resp.status_code, resp.text[:400])
     except Exception as e:
         print("SENT_JOBBER_TOKENS_TO_N8N ERROR", repr(e))
-        return
-
-    print("SENT_JOBBER_TOKENS_TO_N8N", resp.status_code, resp.text[:500])
 
 
 def encode_state(payload: dict) -> str:
-    """
-    Just base64-encodes a small JSON blob.
-    No signature / verification. We're only using this
-    as a container to carry phone_number + client_id through OAuth.
-    """
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("utf-8")
 
@@ -83,7 +71,6 @@ def decode_state(token: str) -> dict:
         raw = base64.urlsafe_b64decode(token.encode("utf-8"))
         return json.loads(raw.decode("utf-8"))
     except Exception:
-        # Treat as "no state info" instead of hard failing
         return {}
 
 
@@ -94,7 +81,6 @@ async def jobber_start(payload: dict):
     """
     Called by your Vercel page.
     Body: { "phone_number": "12185551234" }
-    Returns: { "url": "<Jobber OAuth URL>" }
     """
     phone_number = payload.get("phone_number")
     if not phone_number:
@@ -102,9 +88,8 @@ async def jobber_start(payload: dict):
 
     william_client_id = await get_william_client_id_by_phone(phone_number)
     if not william_client_id:
-        raise HTTPException(status_code=404, detail="Client not found for this phone number")
+        raise HTTPException(status_code=404, detail="Client not found")
 
-    # Pack phone + client into a simple state blob
     state_payload = {
         "client_id": william_client_id,
         "phone_number": phone_number,
@@ -112,17 +97,16 @@ async def jobber_start(payload: dict):
     }
     state = encode_state(state_payload)
 
-    scope = "clients:read clients:write"
-
     from urllib.parse import urlencode
 
     params = {
         "response_type": "code",
         "client_id": JOBBER_CLIENT_ID,
         "redirect_uri": JOBBER_REDIRECT_URI,
-        "scope": scope,
+        "scope": "clients:read clients:write",
         "state": state,
     }
+
     url = f"{JOBBER_AUTH_URL}?{urlencode(params)}"
     return {"url": url}
 
@@ -130,14 +114,9 @@ async def jobber_start(payload: dict):
 @router.get("/jobber/callback")
 async def jobber_callback(request: Request):
     """
-    OAuth callback endpoint Jobber hits after user approves access.
-    Exchanges code for tokens and forwards them to n8n when we
-    have a phone_number in state (started from our connect page).
-
-    If there is no phone_number in state, assume the flow was
-    started from inside Jobber (dashboard / app directory) and
-    redirect the user to a page that explains they must connect
-    via our phone-number flow.
+    OAuth callback from Jobber.
+    If we DO have phone_number → normal happy path
+    If NOT → they clicked “Connect” from Jobber dashboard → redirect them to phone-required page
     """
     code = request.query_params.get("code")
     state = request.query_params.get("state")
@@ -145,20 +124,17 @@ async def jobber_callback(request: Request):
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
-    # Safely decode; returns {} if state is missing/invalid
     state_payload = decode_state(state) if state else {}
     phone_number = state_payload.get("phone_number")
     william_client_id = state_payload.get("client_id")
 
-    # If we don't have a phone_number, we can't map this Jobber
-    # connection to a specific William client. Send them to a
-    # page that tells them how to connect properly.
+    # If they connected from inside Jobber dashboard → no phone number!
     if not phone_number or not william_client_id:
         return RedirectResponse(
             url="https://jobber-connect-frontend.vercel.app/phone-required.html"
         )
 
-    # Normal flow: started from our Vercel connect page
+    # Normal flow → exchange code for tokens
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             JOBBER_TOKEN_URL,
@@ -189,18 +165,25 @@ async def jobber_callback(request: Request):
         expires_in=expires_in,
     )
 
-    # Redirect user to your normal success page
     return RedirectResponse(
         url="https://jobber-connect-frontend.vercel.app/success.html"
     )
 
 
+# ---- ALIAS FOR JOBBER DASHBOARD ---------------------------------------------
+
+@router.get("/callback")
+async def jobber_callback_root(request: Request):
+    """
+    Alias: Jobber sometimes redirects to /callback instead of /jobber/callback.
+    """
+    return await jobber_callback(request)
+
+
+# ---- DEBUG ------------------------------------------------------------------
+
 @router.get("/jobber/test")
 async def jobber_test():
-    """
-    Manual debug endpoint: paste a valid access token for quick tests.
-    Remove in production.
-    """
     access_token = "PASTE_FULL_ACCESS_TOKEN_HERE"
 
     query = {
@@ -208,11 +191,7 @@ async def jobber_test():
         query SampleQuery {
           clients(first: 5) {
             totalCount
-            nodes {
-              id
-              firstName
-              lastName
-            }
+            nodes { id firstName lastName }
           }
         }
         """
@@ -224,7 +203,8 @@ async def jobber_test():
             json=query,
             headers={
                 "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json"},
+                "Accept": "application/json",
+            },
         )
 
     return {"status_code": resp.status_code, "body": resp.json()}
