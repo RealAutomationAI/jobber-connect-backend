@@ -3,8 +3,6 @@
 import os
 import json
 import base64
-import hmac
-import hashlib
 from datetime import datetime
 
 import httpx
@@ -18,7 +16,6 @@ router = APIRouter()
 JOBBER_CLIENT_ID = os.environ["JOBBER_CLIENT_ID"]
 JOBBER_CLIENT_SECRET = os.environ["JOBBER_CLIENT_SECRET"]
 JOBBER_REDIRECT_URI = os.environ["JOBBER_REDIRECT_URI"]  # e.g. https://william-auth-production.up.railway.app/jobber/callback
-# STATE_SECRET removed – we’re not using state any more
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL")      # e.g. https://n8n.yourdomain.com/webhook/jobber-tokens
 
 JOBBER_AUTH_URL = "https://api.getjobber.com/api/oauth/authorize"
@@ -71,6 +68,25 @@ async def store_jobber_tokens_for_client(
     print("SENT_JOBBER_TOKENS_TO_N8N", resp.status_code, resp.text[:500])
 
 
+def encode_state(payload: dict) -> str:
+    """
+    Just base64-encodes a small JSON blob.
+    No signature / verification. We're only using this
+    as a container to carry phone_number + client_id through OAuth.
+    """
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("utf-8")
+
+
+def decode_state(token: str) -> dict:
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        # Worst case we just treat it as missing
+        raise HTTPException(status_code=400, detail="Invalid state")
+
+
 # ==== ROUTES =================================================================
 
 @router.post("/jobber/start")
@@ -84,11 +100,17 @@ async def jobber_start(payload: dict):
     if not phone_number:
         raise HTTPException(status_code=400, detail="phone_number required")
 
-    # You can still map phone -> internal client here if you want,
-    # but it's no longer needed for state.
     william_client_id = await get_william_client_id_by_phone(phone_number)
     if not william_client_id:
         raise HTTPException(status_code=404, detail="Client not found for this phone number")
+
+    # Pack phone + client into a simple state blob
+    state_payload = {
+        "client_id": william_client_id,
+        "phone_number": phone_number,
+        "ts": int(datetime.utcnow().timestamp()),
+    }
+    state = encode_state(state_payload)
 
     scope = "clients:read clients:write"
 
@@ -99,7 +121,7 @@ async def jobber_start(payload: dict):
         "client_id": JOBBER_CLIENT_ID,
         "redirect_uri": JOBBER_REDIRECT_URI,
         "scope": scope,
-        # "state" removed
+        "state": state,
     }
     url = f"{JOBBER_AUTH_URL}?{urlencode(params)}"
     return {"url": url}
@@ -112,16 +134,18 @@ async def jobber_callback(request: Request):
     Exchanges code for tokens and forwards them to n8n.
     """
     code = request.query_params.get("code")
+    state = request.query_params.get("state")
 
-    # We no longer care about state – just require the code.
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
-    # Since we’re not using state to carry metadata any more,
-    # just use your stub client id and an empty phone number.
-    # (If you later want to look up a real client here, you can.)
-    phone_number = ""
-    william_client_id = await get_william_client_id_by_phone(phone_number)
+    if not state:
+        raise HTTPException(status_code=400, detail="Missing state")
+
+    # Decode the simple JSON blob to recover phone + client
+    state_payload = decode_state(state)
+    william_client_id = state_payload.get("client_id") or "unknown_client"
+    phone_number = state_payload.get("phone_number") or ""
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -188,11 +212,7 @@ async def jobber_test():
             json=query,
             headers={
                 "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "X-JOBBER-GRAPHQL-VERSION": JOBBER_GRAPHQL_VERSION,
-            },
-            timeout=15,
+                "Accept": "application/json"},
         )
 
     return {"status_code": resp.status_code, "body": resp.json()}
