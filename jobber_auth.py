@@ -83,8 +83,8 @@ def decode_state(token: str) -> dict:
         raw = base64.urlsafe_b64decode(token.encode("utf-8"))
         return json.loads(raw.decode("utf-8"))
     except Exception:
-        # Worst case we just treat it as missing
-        raise HTTPException(status_code=400, detail="Invalid state")
+        # Treat as "no state info" instead of hard failing
+        return {}
 
 
 # ==== ROUTES =================================================================
@@ -131,7 +131,13 @@ async def jobber_start(payload: dict):
 async def jobber_callback(request: Request):
     """
     OAuth callback endpoint Jobber hits after user approves access.
-    Exchanges code for tokens and forwards them to n8n.
+    Exchanges code for tokens and forwards them to n8n when we
+    have a phone_number in state (started from our connect page).
+
+    If there is no phone_number in state, assume the flow was
+    started from inside Jobber (dashboard / app directory) and
+    redirect the user to a page that explains they must connect
+    via our phone-number flow.
     """
     code = request.query_params.get("code")
     state = request.query_params.get("state")
@@ -139,14 +145,20 @@ async def jobber_callback(request: Request):
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
-    if not state:
-        raise HTTPException(status_code=400, detail="Missing state")
+    # Safely decode; returns {} if state is missing/invalid
+    state_payload = decode_state(state) if state else {}
+    phone_number = state_payload.get("phone_number")
+    william_client_id = state_payload.get("client_id")
 
-    # Decode the simple JSON blob to recover phone + client
-    state_payload = decode_state(state)
-    william_client_id = state_payload.get("client_id") or "unknown_client"
-    phone_number = state_payload.get("phone_number") or ""
+    # If we don't have a phone_number, we can't map this Jobber
+    # connection to a specific William client. Send them to a
+    # page that tells them how to connect properly.
+    if not phone_number or not william_client_id:
+        return RedirectResponse(
+            url="https://jobber-connect-frontend.vercel.app/phone-required.html"
+        )
 
+    # Normal flow: started from our Vercel connect page
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             JOBBER_TOKEN_URL,
@@ -177,7 +189,7 @@ async def jobber_callback(request: Request):
         expires_in=expires_in,
     )
 
-    # Redirect user to your Vercel success page
+    # Redirect user to your normal success page
     return RedirectResponse(
         url="https://jobber-connect-frontend.vercel.app/success.html"
     )
