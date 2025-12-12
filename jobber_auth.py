@@ -6,7 +6,7 @@ import base64
 from datetime import datetime
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 
 router = APIRouter()
@@ -106,6 +106,12 @@ def decode_state(token: str) -> dict:
 
 # ==== ROUTES =================================================================
 
+@router.get("/favicon.ico")
+async def favicon():
+    # Avoid noisy 404s in logs
+    return Response(status_code=204)
+
+
 @router.post("/jobber/start")
 async def jobber_start(payload: dict):
     """
@@ -146,7 +152,11 @@ async def jobber_start(payload: dict):
     return {"url": url}
 
 
+# IMPORTANT:
+# Jobber sometimes redirects to /callback (no /jobber prefix).
+# We register BOTH so either route works.
 @router.get("/jobber/callback")
+@router.get("/callback")
 async def jobber_callback(request: Request):
     """
     OAuth callback endpoint Jobber hits after user approves access.
@@ -250,7 +260,8 @@ async def jobber_test():
             json=query,
             headers={
                 "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json"},
+                "Accept": "application/json",
+            },
         )
 
     return {"status_code": resp.status_code, "body": resp.json()}
